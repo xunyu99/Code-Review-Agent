@@ -1,0 +1,8 @@
+.env
+__pycache__/
+.memory/
+.tasks/
+.transcripts/
+.task_outputs/
+.tmp/
+sessions/

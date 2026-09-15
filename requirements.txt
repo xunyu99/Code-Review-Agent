@@ -1,0 +1,9 @@
+# 核心：模型调用 + 环境变量
+openai
+python-dotenv
+
+# 终端 UI（ui.py）：rich 渲染、prompt_toolkit 管输入、pygments 供代码高亮
+# rich 必须 >=13.4：更早的版本没有 rich.syntax.SyntaxTheme，代码块配色会在 import 时就失败
+rich>=13.4
+prompt_toolkit>=3.0
+pygments>=2.12
