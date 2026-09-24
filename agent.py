@@ -494,26 +494,44 @@ def _repeat_hint(counts: dict, tool_name: str, args: dict) -> str:
             f"你已经调用过这个，换个做法：换参数、换工具，或者直接把结论写出来。")
 
 
+# 半截回答的收尾标记。只进 messages，不进屏幕：用户知道自己按了 Ctrl+C，
+# 需要被提醒的是模型 —— 上面那句是我自己没写完的，不是我说完了。
+# 没有这个标记，模型看到自己一句断掉的话，会想「把它补完」，
+# 而不是「用户打断了，重新计划」。这正好和用户按 Ctrl+C 的意图相反。
+PARTIAL_MARK = "\n\n[user interrupted mid-response; the text above is truncated and incomplete]"
+
+
 def _abort_turn(messages) -> None:
     """Ctrl+C 的统一收尾：停 Live / spinner、保住已生成的内容、补齐没回来的工具结果。
     和 fatal() 一个思路——所有放弃路径都走同一个出口，别把状态留在半路。"""
+    # 顺序有意义：先封口，再追加半截文本。
+    # repair_dangling_tool_calls 是从尾往前找「最后一条非 tool 消息」然后 break，
+    # 先把半截 assistant 塞进去的话，它会被当成对话真正的结尾，悬空的工具调用就漏封了。
+    # （实际跑起来这两件事互斥：commit() 会把 buffer 清空，所以有悬空调用时 partial 必为空。
+    #   但依赖这种巧合太脆，顺序摆对就永远不用管。）
+    repair_dangling_tool_calls(messages, placeholder="[interrupted by user]")
     view = _ACTIVE["view"]
     if view is not None:
-        partial = view.interrupt()            # 停 Live + 把半截回答永久打印出来
+        partial = view.interrupt()            # 停 Live + 把半截回答打印出来（屏幕上不带标记）
         if partial:
-            messages.append({"role": "assistant", "content": partial})
+            messages.append({"role": "assistant", "content": partial + PARTIAL_MARK})
     tracker.stop()
-    repair_dangling_tool_calls(messages, placeholder="[interrupted by user]")
     warn("^C 已中断本轮（可以继续提问）")
 
 
 def agent_loop(messages, context):
-    """对外入口：Ctrl+C 在这一层吃掉——只中断本轮，程序不退。"""
+    """对外入口：Ctrl+C 在这一层吃掉——只中断本轮，程序不退。
+
+    返回值：正常跑完是 None；本轮被 Ctrl+C 打断时返回 "interrupted"。
+    调用方看到它就该跳过「事后动作」（提炼记忆之类）——
+    半截对话没有结论，不该拿它去下判断。
+    """
     _ACTIVE["view"] = None
     try:
         return _agent_loop_inner(messages, context)
     except KeyboardInterrupt:
         _abort_turn(messages)
+        return "interrupted"
 
 
 def _agent_loop_inner(messages, context):

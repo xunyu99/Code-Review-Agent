@@ -26,10 +26,13 @@ if _args and _args[0] == "resume":
     if not _resume_id:
         print("用法: python main.py resume <session_id>")
         sys.exit(1)
-    # 此时还不能 import config（会冻结 WORKDIR），先裸读会话文件拿 workdir
+    # 此时还不能 import config（会冻结 WORKDIR），先裸读会话文件拿 workdir。
+    # 新格式是 .state.json，旧格式是 .json —— 两个都认，旧的照样能 resume。
     y, m, d = _resume_id[:4], _resume_id[5:7], _resume_id[8:10]
-    _sf = _PROJECT / "sessions" / y / m / d / f"{_resume_id}.json"
-    if not _sf.exists():
+    _dir = _PROJECT / "sessions" / y / m / d
+    _sf = next((p for p in (_dir / f"{_resume_id}.state.json",
+                            _dir / f"{_resume_id}.json") if p.exists()), None)
+    if _sf is None:
         print(f"找不到会话 {_resume_id}")
         sys.exit(1)
     repo = json.loads(_sf.read_text(encoding="utf-8"))["workdir"]
@@ -59,7 +62,7 @@ os.environ["WORKDIR"] = repo
 from config import WORKDIR, MAX_INPUT_CHARS
 from agent import agent_loop, repair_dangling_tool_calls
 from system_prompt import update_context
-from session import new_session, save_session, load_session
+from session import new_session, save_session, load_session, open_session, load_raw_messages
 from memory import extract_memories, consolidate_memories, CONSOLIDATE_THRESHOLD, list_memory_files
 from ui import console, welcome, ask, show_answer, show_user, warn, info
 
@@ -107,7 +110,18 @@ def main():
     else:
         session = new_session(WORKDIR)
 
-    messages = session["messages"]                          # ← 会话级共享这一份
+    # ── 这里把「存档」和「上下文」分开 ──
+    # messages = 工作副本（会被压缩改写），log = 原文日志（只追加，压缩碰不到）。
+    # 以前是 messages = session["messages"]：一个东西身兼两职，压缩一动手原文就没了。
+    messages, log = open_session(session)
+
+    # 把这条界线明明白白打给用户看：存档里多少条，当前上下文只剩多少条
+    raw_count = len(load_raw_messages(session["id"]) or [])
+    live_count = sum(1 for m in messages if m.get("role") != "system")
+    if raw_count > live_count:
+        info(f"存档 {raw_count} 条 · 当前上下文 {live_count} 条"
+             f"（压缩掉 {raw_count - live_count} 条，原文仍在 .jsonl）")
+
     if not messages or messages[0].get("role") != "system":
         messages.insert(0, {"role": "system", "content": ""})   # 占位，agent_loop 每轮重建
 
@@ -130,11 +144,17 @@ def main():
             context = update_context()
             messages.append({"role": "user", "content": query})
             show_user(query)
-            agent_loop(messages, context)   # 里面的 Ctrl+C 由 agent_loop 自己消化，本轮作废
+            # 里面的 Ctrl+C 由 agent_loop 自己消化：本轮作废，但已经生成的内容照常保住
+            interrupted = agent_loop(messages, context) == "interrupted"
             safe_save(session)                               # 每轮结束存盘
-            extract_memories(messages)
-            if len(list_memory_files()) >= CONSOLIDATE_THRESHOLD:
-                consolidate_memories()
+            if interrupted:
+                # 被打断的那一轮没有结论。记忆是跨会话长期留着的，从没跑完的一轮里
+                # 提炼出来的「发现」会污染以后每一次会话 —— 这比省一次 API 调用重要得多。
+                info("本轮被中断，跳过记忆提炼")
+            else:
+                extract_memories(messages)
+                if len(list_memory_files()) >= CONSOLIDATE_THRESHOLD:
+                    consolidate_memories()
             # 回答已经由 ui.StreamView 边流边打完了，这里不再补打一遍（以前会重复整段）
         except EOFError:
             # Ctrl+D / Ctrl+Z：输入流结束，按约定退出

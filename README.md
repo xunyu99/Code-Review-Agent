@@ -29,7 +29,8 @@ python main.py resume 2026-09-15_00-20-02    # 恢复某个会话
 - **错误恢复**：429/529 指数退避重试、输出被 `max_tokens` 截断后的续写、上下文超限后的强制压缩。
 - **技能**：`skills/*/SKILL.md` 启动时扫成注册表，模型按需 `load_skill` 拉正文（两级加载，正文不常驻上下文）。
 - **记忆**：每轮结束让模型从对话里提炼可复用结论，落成 `.memory/*.md`，超过阈值自动合并去重。
-- **会话**：每轮存盘到 `sessions/年/月/日/<id>.json`，随时 `resume` 接着聊。
+- **会话**：一个会话两份文件——`<id>.jsonl` 是只追加的**原文日志**（压缩碰不到），
+  `<id>.state.json` 是每轮覆盖的**工作副本**（发给模型的那份，会被压缩改写）。随时 `resume` 接着聊。
 
 ## 目录结构
 
@@ -41,7 +42,7 @@ code-review-agent/
 ├── tools.py           工具定义与实现（只用 guard() 兜底，不写策略）
 ├── system_prompt.py   system prompt 组装 + 技能注册表
 ├── memory.py          记忆提炼 / 索引 / 合并
-├── session.py         会话读写
+├── session.py         会话读写：原文日志（只追加）+ 工作副本（可压缩）
 ├── ui.py              终端展示层（rich + prompt_toolkit），全项目唯一直接碰终端的地方
 ├── config.py          所有常量的唯一出处（含「家不能当审查目标」的守卫）
 ├── skills/            SKILL.md 技能库
@@ -85,6 +86,16 @@ code-review-agent/
 | `MAX_INPUT_CHARS` | 2000 | 单轮用户输入上限 |
 | `MAX_RECOVERY_RETRIES` | 3 | 输出被截断后的续写次数 |
 | `REPEAT_HINT_AFTER` | 5 | 同一轮里同一调用重复几次开始提醒 |
+
+## 测试与量化
+
+测试方案、用例清单、量化口径都写在 [TESTING.md](TESTING.md)：模型不确定的部分不进测试，边界内是纯函数（表驱动覆盖），边界外用假流模拟，需要真模型的只做手工验收。
+
+```bash
+python tests/run_tests.py     # 零依赖，没装 pytest 也能跑
+pytest -q tests/              # 装了 pytest 就用这个
+python bench/measure.py       # 打印量化表（离线，不调 API）
+```
 
 ## 已知边界
 
