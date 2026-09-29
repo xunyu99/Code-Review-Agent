@@ -1,8 +1,22 @@
+# ---- 密钥 ----
 .env
+
+# ---- Python 缓存 ----
 __pycache__/
+
+# ---- agent 自己的运行区（记忆 / 会话 / 存档 / 临时）----
 .memory/
 .tasks/
 .transcripts/
 .task_outputs/
 .tmp/
 sessions/
+archives/
+
+# ---- 评测：运行记录与任务夹具都算本地数据，不进仓库 ----
+#   运行记录每次跑都会攒，且 json 里带本机绝对路径
+bench/runs/
+bench/runs-baseline/
+#   任务夹具不随仓库发布 —— 使用者拿自己的仓库去跑（--repo 指哪审哪）
+bench/tasks/
+*.log

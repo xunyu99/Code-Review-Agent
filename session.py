@@ -1,14 +1,17 @@
-"""session.py — 会话持久化：一个会话两份文件，按 年/月/日 分层。
+"""session.py — 会话持久化：一个会话两份文件，分两棵树放，各按 年/月/日 分层。
 
 两份文件的分工（这是本项目最容易搞混的一处，别混）：
 
-  sessions/年/月/日/<id>.jsonl        原文日志 —— 只追加，永不改写
+  archives/年/月/日/<id>.jsonl        原文日志 —— 只追加，永不改写
       每条消息产生时就落一行。压缩对它零影响。
       用途：存档、审计、兜底重建。
 
   sessions/年/月/日/<id>.state.json   工作副本 —— 每轮整体覆盖
       就是发给模型的那份 messages，可能已经被 L1–L4 压过。
       以前它和存档是同一份文件，所以压缩一动手，原文就没了。
+
+它们曾经同住 sessions/ 一个目录，文件名又只差一个后缀，很容易看混 ——
+所以现在分两棵树：**sessions 是给程序读的上下文，archives 是给人读的存档。**
 
 一句话：**上下文会被压缩，存档不会。**
 
@@ -19,7 +22,7 @@
 import json
 from datetime import datetime
 from pathlib import Path
-from config import SESSIONS_DIR
+from config import SESSIONS_DIR, ARCHIVE_DIR
 
 
 def new_session(workdir: str) -> dict:
@@ -34,20 +37,26 @@ def new_session(workdir: str) -> dict:
     }
 
 
-def _dir(sid: str) -> Path:
-    """id 自带年月日时分秒 → 自动算出 年/月/日 目录。"""
+def _dir(sid: str, root: Path | None = None) -> Path:
+    """id 自带年月日时分秒 → 自动算出 年/月/日 目录。
+
+    root 默认走模块全局 SESSIONS_DIR，而不是写成 `root=SESSIONS_DIR` ——
+    默认参数在**函数定义时**求值一次，那样测试里 patch SESSIONS_DIR 会失效，
+    还会悄悄写到真目录去。
+    """
+    root = SESSIONS_DIR if root is None else root
     y, m, d = sid[:4], sid[5:7], sid[8:10]      # "2026-09-13_20-15-00"
-    return SESSIONS_DIR / y / m / d
+    return root / y / m / d
 
 
 def state_path(sid: str) -> Path:
-    """工作副本（发给模型的那份上下文）。"""
+    """工作副本（发给模型的那份上下文），在 sessions/ 下。"""
     return _dir(sid) / f"{sid}.state.json"
 
 
 def log_path(sid: str) -> Path:
-    """原文日志（只追加的存档）。"""
-    return _dir(sid) / f"{sid}.jsonl"
+    """原文日志（只追加的存档），在 archives/ 下。"""
+    return _dir(sid, ARCHIVE_DIR) / f"{sid}.jsonl"
 
 
 def legacy_path(sid: str) -> Path:
@@ -126,35 +135,49 @@ class SessionLog:
                 self._warned = True
                 _warn(f"原文日志写入失败（本会话不再重复提醒）: {type(e).__name__}: {e}")
 
-    def ensure_started(self, messages) -> int:
-        """首次打开时建日志头；老会话把现有工作副本灌进去，返回灌入条数。
+    def ensure_started(self, messages=()) -> int:
+        """首次真要写东西时才建日志头（meta）；老会话顺便把现有工作副本灌进去。
 
-        注意用 _started 判断「是否首次」而不是 exists()：write_meta 之后文件
-        就已经存在了，用 exists() 判会把 seed 整段误跳过去。
+        懒建是故意的：**空会话不该在盘上留文件**。启动一下、一个字没输就退出，
+        以前什么都不留；如果开日志时就把 meta 写下去，就会留个空壳。
+
+        注意用 _started 判断「是否首次」而不是 exists()：写完 meta 文件就存在了，
+        用 exists() 判会把 seed 整段误跳过去。
         """
         if self._started:
             return 0
         s = self._session
+        self._started = True      # 先置位：下面灌历史会再进 append_message，别递归
         self._write({"type": "meta", "ts": _now(), "id": s.get("id"),
                      "title": s.get("title"), "created": s.get("created"),
                      "workdir": s.get("workdir")})
+        if not messages:
+            return 0
+        self._write({"type": "seed", "ts": _now(), "source": "state",
+                     "note": "该会话早于日志功能，此处灌入的是当时的工作副本，可能已压缩过"})
         n = 0
-        if messages:
-            self._write({"type": "seed", "ts": _now(), "source": "state",
-                         "note": "该会话早于日志功能，此处灌入的是当时的工作副本，可能已压缩过"})
-            for m in messages:
-                if m.get("role") == "system":
-                    continue
-                self.append_message(m)
-                n += 1
-        self._started = True
+        for m in messages:
+            if m.get("role") == "system":
+                continue
+            self.append_message(m)
+            n += 1
         return n
 
     def append_message(self, message: dict) -> None:
         """记一条原始消息。system 不记 —— 它每步都被 agent_loop 重建，不是对话内容。"""
         if message.get("role") == "system":
             return
+        self.ensure_started()      # 第一条真消息来了才建日志，空会话不留痕
         self._write({"type": "msg", "ts": _now(), "message": message})
+
+    def append_record(self, record: dict) -> None:
+        """补一条自定义记录（usage / 实际模型版本之类），和消息一样只追加。
+
+        压缩碰不到它，重放也认得它：`type` 不是 `msg` 的记录，重放时会原样跳过。
+        写失败只在 _write 里警告一次，不影响这一轮对话。
+        """
+        self.ensure_started()
+        self._write({"ts": _now(), **record})
 
 
 class LoggedList(list):
@@ -186,10 +209,24 @@ def open_session(session: dict) -> tuple[LoggedList, SessionLog]:
     """
     log = SessionLog(session)
     msgs = session.get("messages") or []
-    log.ensure_started(msgs)
+    if msgs:                       # 有内容才建日志；空的等第一条消息自己建
+        log.ensure_started(msgs)
     logged = LoggedList(msgs, log)
     session["messages"] = logged
     return logged, log
+
+
+def append_record(messages, record: dict) -> bool:
+    """给挂在 messages 上的那份日志补一条记录。
+
+    没有挂日志（比如测试里直接传一个普通 list）就静默跳过、返回 False ——
+    调用方不需要先判断自己拿到的是不是 LoggedList。
+    """
+    log = getattr(messages, "_log", None)
+    if log is None:
+        return False
+    log.append_record(record)
+    return True
 
 
 def load_raw_messages(sid: str) -> list | None:

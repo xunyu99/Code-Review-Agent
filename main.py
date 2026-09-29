@@ -2,16 +2,19 @@
 import os, sys, json, time
 from pathlib import Path
 
-_PROJECT = Path(__file__).parent.resolve()
+_CODE_DIR = Path(__file__).parent.resolve()
+# 家的位置（会话写在它下面）—— 跟 config.py 同一套规则：AGENT_HOME 优先。
+# 必须在 import config 之前算出来：resume 要去 sessions/ 找文件，而 config 还没加载。
+_PROJECT = Path(os.getenv("AGENT_HOME") or _CODE_DIR).resolve()
 
 
 def _is_agent_home(p) -> bool:
-    """agent 的家（或它的子目录）不能当审查目标 —— 那是私产，不是仓库。"""
+    """agent 的家 / 代码目录（或它们的子目录）不能当审查目标 —— 那是私产，不是仓库。"""
     try:
         rp = Path(p).resolve()
     except Exception:
         return False
-    return rp == _PROJECT or rp.is_relative_to(_PROJECT)
+    return any(rp == d or rp.is_relative_to(d) for d in {_PROJECT, _CODE_DIR})
 
 
 # ⚠ WORKDIR 必须在 import config 之前设定（config import 时冻结，且会做家的边界检查）
@@ -60,7 +63,7 @@ os.environ["WORKDIR"] = repo
 
 # ── 统一 import（WORKDIR 冻结之后）──
 from config import WORKDIR, MAX_INPUT_CHARS
-from agent import agent_loop, repair_dangling_tool_calls
+from agent import agent_loop, repair_dangling_tool_calls, turn_completed, INTERRUPTED
 from system_prompt import update_context
 from session import new_session, save_session, load_session, open_session, load_raw_messages
 from memory import extract_memories, consolidate_memories, CONSOLIDATE_THRESHOLD, list_memory_files
@@ -90,8 +93,41 @@ def goodbye(session, messages):
         console.print("[ui.dim]bye[/]")
 
 
+def _require_interactive_console():
+    """prompt_toolkit 要一个真的控制台。
+
+    没有它的话，会在第一次输入时抛 NoConsoleScreenBufferError —— 用户看到的是
+    一坨 traceback，还以为是 agent 崩了。在入口处先说清楚，比事后解释便宜。
+    """
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        return
+    console.print()
+    warn("这个 CLI 需要交互式终端：stdin/stdout 不是 tty。")
+    info("如果是从 IDE 的「运行」按钮、管道、重定向或后台启动的，"
+         "请在终端里直接跑 python main.py")
+    sys.exit(2)
+
+
+def after_turn(messages, status) -> None:
+    """一轮跑完之后的事后动作 —— 只有正常跑完的一轮才配提炼记忆。
+
+    中断 / 报错 / 撞上 MAX_STEPS 都是「这轮没有结论」。从没跑完的一轮里提炼出来的
+    「发现」会长期留在 .memory/ 里，跟着进以后每一次会话，比省一次 API 调用贵得多。
+    撞上限那轮**即使抢救出了报告也不算** —— 那份报告自己就标着「未能验证」，
+    正是不该被当成持久知识的东西。
+    """
+    if not turn_completed(status):
+        why = "被中断" if status == INTERRUPTED else "失败（报错 / 撞上限）"
+        info(f"本轮{why}，跳过记忆提炼")
+        return
+    extract_memories(messages)
+    if len(list_memory_files()) >= CONSOLIDATE_THRESHOLD:
+        consolidate_memories()
+
+
 def main():
     welcome()
+    _require_interactive_console()
 
     if _resume_id:
         session = load_session(_resume_id)
@@ -145,16 +181,9 @@ def main():
             messages.append({"role": "user", "content": query})
             show_user(query)
             # 里面的 Ctrl+C 由 agent_loop 自己消化：本轮作废，但已经生成的内容照常保住
-            interrupted = agent_loop(messages, context) == "interrupted"
+            status = agent_loop(messages, context)
             safe_save(session)                               # 每轮结束存盘
-            if interrupted:
-                # 被打断的那一轮没有结论。记忆是跨会话长期留着的，从没跑完的一轮里
-                # 提炼出来的「发现」会污染以后每一次会话 —— 这比省一次 API 调用重要得多。
-                info("本轮被中断，跳过记忆提炼")
-            else:
-                extract_memories(messages)
-                if len(list_memory_files()) >= CONSOLIDATE_THRESHOLD:
-                    consolidate_memories()
+            after_turn(messages, status)
             # 回答已经由 ui.StreamView 边流边打完了，这里不再补打一遍（以前会重复整段）
         except EOFError:
             # Ctrl+D / Ctrl+Z：输入流结束，按约定退出

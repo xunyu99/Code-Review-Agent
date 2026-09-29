@@ -14,9 +14,9 @@ copy .env.example .env        # 然后把 .env 里的 key 换成你自己的
 运行（`WORKDIR` 是「被审查的仓库」，不是本项目的目录）：
 
 ```bash
-python main.py E:\some\repo                  # 新会话
+python main.py D:\my-project                                        # 新会话（启动CLI终端界面）
 python main.py                               # 不带参数就交互式问你要审查目录
-python main.py resume 2026-09-15_00-20-02    # 恢复某个会话
+python main.py resume 2026-09-15_00-20-02    # 恢复某个会话（启动CLI终端界面）
 ```
 
 交互约定：`Enter` 提交 · `Alt+Enter` 换行 · `↑↓` 翻历史 · `Ctrl+C` 中断本轮（连按两次退出）· `exit` 退出。
@@ -28,9 +28,9 @@ python main.py resume 2026-09-15_00-20-02    # 恢复某个会话
 - **上下文压缩**：L1 裁中间 → L2 旧结果换占位符 → L3 大输出落盘 → L4 LLM 摘要，外加超限时的 reactive 兜底。
 - **错误恢复**：429/529 指数退避重试、输出被 `max_tokens` 截断后的续写、上下文超限后的强制压缩。
 - **技能**：`skills/*/SKILL.md` 启动时扫成注册表，模型按需 `load_skill` 拉正文（两级加载，正文不常驻上下文）。
-- **记忆**：每轮结束让模型从对话里提炼可复用结论，落成 `.memory/*.md`，超过阈值自动合并去重。
-- **会话**：一个会话两份文件——`<id>.jsonl` 是只追加的**原文日志**（压缩碰不到），
-  `<id>.state.json` 是每轮覆盖的**工作副本**（发给模型的那份，会被压缩改写）。随时 `resume` 接着聊。
+- **记忆**：每轮结束让模型从对话里提炼可复用结论，落成 `.memory/*.md`，超过阈值自动合并去重。**只有正常跑完的一轮才提炼**——被中断 / 报错 / 撞上 `MAX_STEPS` 的轮次没有结论（撞上限那轮即使被抢救出一份报告也不算），不往长期记忆里灌。
+- **会话**：一个会话拆成两棵树——`sessions/` 放每轮覆盖的**工作副本**（发给模型的那份，会被压缩改写），
+  `archives/` 放只追加的**原文日志**（压缩碰不到）。一句话：**上下文会被压缩，存档不会。** 随时 `resume` 接着聊。
 
 ## 目录结构
 
@@ -42,11 +42,12 @@ code-review-agent/
 ├── tools.py           工具定义与实现（只用 guard() 兜底，不写策略）
 ├── system_prompt.py   system prompt 组装 + 技能注册表
 ├── memory.py          记忆提炼 / 索引 / 合并
-├── session.py         会话读写：原文日志（只追加）+ 工作副本（可压缩）
+├── session.py         会话读写：archives/ 原文日志（只追加）+ sessions/ 工作副本（可压缩）
 ├── ui.py              终端展示层（rich + prompt_toolkit），全项目唯一直接碰终端的地方
 ├── config.py          所有常量的唯一出处（含「家不能当审查目标」的守卫）
 ├── skills/            SKILL.md 技能库
-├── sessions/          会话存档（不进仓库）
+├── sessions/          会话的当前上下文（不进仓库）
+├── archives/          会话的原文存档（不进仓库）
 ├── .memory/           记忆库（不进仓库）
 └── .tmp/              agent 自己的临时工作区（读写免问，不进仓库）
 ```
@@ -62,7 +63,7 @@ code-review-agent/
 | `WORKDIR`（被审查的仓库） | allow | ask | 审查是读的活，改仓库先问用户 |
 | `.tmp` | allow | allow | agent 自己的临时区，唯一免问的地方 |
 | `skills` / `.task_outputs` / `.memory` | allow | deny | 代码写、模型读，模型不该自己写 |
-| `sessions` / `.transcripts` | deny | deny | agent 自己管，模型碰不得 |
+| `sessions` / `archives` / `.transcripts` | deny | deny | agent 自己管，模型碰不得 |
 | `PROJECT_DIR`（本项目的家） | deny | deny | 源码 / `.env` / key 都在里面，整棵树禁掉 |
 | 其它任何路径 | deny | deny | 名单外直接拒，连问都不问 |
 
@@ -82,25 +83,55 @@ code-review-agent/
 | `MAX_TOKENS` * | 8192 | 单次回复最大 token |
 | `THRESHOLD` | 200000 | 上下文压缩阈值（单位是**字符**，不是 token） |
 | `MAX_STEPS` | 20 | 单轮任务最多循环几步 |
+| `STEP_WARN_REMAINING` | 5 | 剩余几步时，提示从「该收尾了」升级成「停止调工具、开始写报告」 |
+| `STEP_BUDGET_NOTICE` | on | 关掉（`off`）就完全不追加步数预算提示 —— 消融实验用 |
+| `SALVAGE_ON_MAX_STEPS` | True | 撞上 `MAX_STEPS` 后再花一次调用，逼它用已有信息抢救一份报告 |
+| `REPORT_CHARS_LIMIT` | 3000 | 报告总长上限（写进提示词，靠模型自觉；**不是**靠 `MAX_TOKENS` 截断） |
 | `BASH_TIMEOUT` | 60 | bash 超时秒数 |
 | `MAX_INPUT_CHARS` | 2000 | 单轮用户输入上限 |
 | `MAX_RECOVERY_RETRIES` | 3 | 输出被截断后的续写次数 |
 | `REPEAT_HINT_AFTER` | 5 | 同一轮里同一调用重复几次开始提醒 |
 
+`STEP_WARN_REMAINING` 和 `SALVAGE_ON_MAX_STEPS` 是一对：平时的预算提示是**劝**（每步在发给 API 的消息末尾追加一条剩余步数，见 `agent.step_budget_notice`），撞上限后的抢救是**兜底**（`agent.salvage_report`）。抢救出的报告排在 `[Error] max steps` 之前，所以 `bench` 会同时记下「报告字数 > 0」和「结束原因是撞上限」——有产出，但不算成功。
+
+`REPORT_CHARS_LIMIT` 单独说一句：**别用 `MAX_TOKENS` 去管报告长度**。它管的是「单次回复生成到哪停下」，报到上限会被 `finish_reason="length"` 接住、走续写分支，把整段对话重发一遍换后半截 —— 报告没变短，输入 token 反而翻倍。实测那两份 6,292 / 8,310 字的报告整轮输出才 4,579 token，离 8192 差得远：它写这么长是没人告诉它别写。
+
+这三项（`STEP_BUDGET_NOTICE` / `REPORT_CHARS_LIMIT` / `STEP_WARN_REMAINING`）都支持**环境变量覆盖**，所以消融实验不用改代码：
+
+```powershell
+$env:STEP_BUDGET_NOTICE = "off"     # 摘掉步数预算提示
+$env:REPORT_CHARS_LIMIT = "0"       # 摘掉报告长度约束（0 = 完全不提）
+python bench\run_task.py --label caption-v1-ablation ...
+```
+
+这条约束的**措辞和数字都被真跑改过**：1500 那版写的是「最多 5 条，宁可丢掉弱的」，复测发现字数砍到 1/3、召回也从 6.5/8 掉到 3.5/8 —— 那句话等于授权模型少报。现在改成「压每一条的写法，不许砍掉有证据的发现」，条数放宽到 8，数字放到 3000。
+
 ## 测试与量化
 
-测试方案、用例清单、量化口径都写在 [TESTING.md](TESTING.md)：模型不确定的部分不进测试，边界内是纯函数（表驱动覆盖），边界外用假流模拟，需要真模型的只做手工验收。
+原则是**模型不确定的部分不进单测**：边界内全是纯函数（表驱动覆盖），边界外用假响应模拟，需要真模型的只做手工验收。测试全程用占位 key、不联网、也绝不读 `.env` 里的真 key（见 `tests/_bootstrap.py`）。
 
 ```bash
 python tests/run_tests.py     # 零依赖，没装 pytest 也能跑
 pytest -q tests/              # 装了 pytest 就用这个
-python bench/measure.py       # 打印量化表（离线，不调 API）
 ```
+
+带真模型跑的评测放在 `bench/`（要 API key 和网络，跑之前先想清楚花销）。`--repo` 指到哪个仓库就审哪个：
+
+```bash
+python bench/run_task.py --label my-task --repo D:\path\to\repo   # 跑主 agent
+python bench/baseline.py --label my-task --repo D:\path\to\repo   # 跑基线：同样记账，换成 60 行裸循环
+python bench/score.py my-task                                     # 看主 agent 这轮的结果
+python bench/score.py --root bench/runs-baseline my-task          # 看基线那轮
+```
+
+**评测任务夹具不在仓库里**（`bench/tasks/` 已被 `.gitignore` 挡掉）——自己指一个仓库去跑就行，结论对任何仓库都成立。
+
+`bench/baseline.py` 是**对照跑道**：同一批任务、同一套记账、同一个 `MAX_STEPS`，只把 agent 实现换成裸循环（没有技能 / 记忆 / 压缩 / 预算提示 / 撞上限兜底）。它落在 `bench/runs-baseline/`，不碰 `bench/runs/`。剥掉了什么、保留了什么，`bench/bare_worker.py` 开头有张表——那张表就是口径。
 
 ## 已知边界
 
 - **文件没有回退**：`write_file` / `edit_file` 直接落盘，写前不备份；`Ctrl+C` 只保住半截回答，不撤销已写入的文件。要回退请用 git。
-- **权限是路径级的，不是内容级的**：它只判断「这个路径让不让碰」，不会拦「读工作目录里的 `.env` / 密钥文件」这种行为。
+- **权限是路径级的，不是内容级的**：它只判断「这个路径让不让碰」，不会扫文件内容。但有**一条内容无关的例外**：`.env` / `*.env` / `*.pem` / `*.key` / `id_rsa` 这类**按文件名就能认出的密钥文件，任何目录下都不给读也不给写**（`.env.example` 这类示例文件放行）。拦不住的是蓄意绕过 —— `python -c "open('.env').read()"` 这种内联执行看不见。
 - **压缩会丢信息**：L1 / L2 不可逆（旧工具结果被换成占位符），需要时模型得重新读。
 - **重复调用只提醒不拦截**：到 `REPEAT_HINT_AFTER` 次开始附一句「换个做法」，防的是原地打转。
 - **模型返回坏 JSON / 参数不对不崩**：转成一条 `Error: tool call failed: ...` 的工具结果回给模型自纠。
@@ -108,37 +139,6 @@ python bench/measure.py       # 打印量化表（离线，不调 API）
 
 ## 什么不该进仓库
 
-`.gitignore` 已经挡掉 `.env`、`__pycache__/`、`sessions/`、`.memory/`、`.tmp/`、`.task_outputs/`、`.transcripts/`。
+`.gitignore` 已经挡掉 `.env`、`__pycache__/`、`sessions/`、`archives/`、`.memory/`、`.tmp/`、`.task_outputs/`、`.transcripts/`，以及评测的**运行记录和任务夹具**（`bench/runs/`、`bench/runs-baseline/`、`bench/tasks/`）——那些是本地数据，体积大、还带本机绝对路径，不该进仓库。
 
 新克隆的人只需要 `copy .env.example .env` 再填 key —— **`.env` 永远只提交副本，不提交真件**。
-
-## git 提交仓库
-
-Set-Alias git "E:\工作\git-local\Git\cmd\git.exe"
-git --version
-
-cd E:\learn_claude_code\code-review-agent
-git init
-git config user.name  "你的名字"      # 以前没配过才需要
-git config user.email "你的邮箱"
-
-git status --short                   # ← 关键一步，见下面的检查标准
-git add .
-git status --short
-git commit -m "init: code review agent"
-git branch -M main
-
-
-建远程并推送
-git remote add origin https://github.com/<你的用户名>/<仓库名>.git
-git push -u origin main
-
-以后日常 + 回退
-git status                          # 看改了什么
-git add -A && git commit -m "说明"  # 存一个点
-git push
-
-git log --oneline --graph -10        # 看历史
-git checkout -- path\to\file.py      # 丢掉某个文件还没提交的改动
-git restore path\to\file.py          # 同上（新写法）
-git reset --hard <commit-id>         # 回到某次提交（未提交的改动会没）

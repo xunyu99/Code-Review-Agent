@@ -25,9 +25,12 @@ def _cleanup_tmp_dirs():
 
 
 def _new_session():
-    """把 session 的存档根目录指到临时目录，返回一个新会话。"""
-    session.SESSIONS_DIR = Path(tempfile.mkdtemp(prefix="cr-agent-sessions-"))
-    _TMP_DIRS.append(session.SESSIONS_DIR)
+    """把 session 的两棵目录树都指到临时目录，返回一个新会话。"""
+    for attr, prefix in (("SESSIONS_DIR", "cr-agent-sessions-"),
+                         ("ARCHIVE_DIR", "cr-agent-archives-")):
+        d = Path(tempfile.mkdtemp(prefix=prefix))
+        setattr(session, attr, d)
+        _TMP_DIRS.append(d)
     return session.new_session("E:\\fake\\repo")
 
 
@@ -44,6 +47,23 @@ def _fill(msgs, n):
 
 
 # ── 基本读写 ──
+
+def test_empty_session_leaves_nothing_on_disk():
+    """启动一下、一个字没输就退出：盘上不该有任何东西。
+
+    日志是懒建的 —— 第一条真消息来了才写 meta。否则每次误启动都会留下一个空壳文件。
+    """
+    s = _new_session()
+    msgs, _ = session.open_session(s)
+    msgs.insert(0, {"role": "system", "content": ""})   # main.py 会插这个占位
+
+    assert not session.log_path(s["id"]).exists()
+    assert not session.state_path(s["id"]).exists()
+    assert session.load_raw_messages(s["id"]) is None
+
+    msgs.append({"role": "user", "content": "第一句"})   # 第一条真消息 → 日志才建起来
+    assert [r["type"] for r in _records(s["id"])] == ["meta", "msg"]
+
 
 def test_state_roundtrip_and_log_only_gets_real_messages():
     s = _new_session()
@@ -63,10 +83,16 @@ def test_state_roundtrip_and_log_only_gets_real_messages():
 
 
 def test_paths_split_into_two_files():
+    """两份文件分居两棵树：sessions/ 是上下文，archives/ 是存档。"""
     s = _new_session()
     assert session.state_path(s["id"]).name == f"{s['id']}.state.json"
     assert session.log_path(s["id"]).name == f"{s['id']}.jsonl"
-    assert session.state_path(s["id"]).parent == session.log_path(s["id"]).parent
+    assert session.state_path(s["id"]).is_relative_to(session.SESSIONS_DIR)
+    assert session.log_path(s["id"]).is_relative_to(session.ARCHIVE_DIR)
+    # 日期分层一样（年/月/日），只是根不同 —— 两边永远不会落在同一个目录里
+    assert session.state_path(s["id"]).parent.parts[-3:] == \
+           session.log_path(s["id"]).parent.parts[-3:]
+    assert session.state_path(s["id"]).parent != session.log_path(s["id"]).parent
 
 
 # ── 核心：压缩不许碰存档 ──

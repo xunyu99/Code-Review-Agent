@@ -6,7 +6,9 @@ V0 只留 5 个基础工具；todo/task/compact/load_skill 等 V1 回归。
 """
 import codecs
 import locale
+import re
 import subprocess
+import tempfile
 from config import WORKDIR, BASH_TIMEOUT
 from permissions import DENY_LIST, guard
 from system_prompt import SKILL_REGISTRY
@@ -17,7 +19,15 @@ from pathlib import Path
 TOOLS = [
     {"type": "function", "function": {
         "name": "bash",
-        "description": "Run a shell command and return its stdout/stderr.",
+        "description": "Run a shell command and return its output. On this Windows box it runs cmd.exe, "
+                       "NOT bash — use dir / findstr / type, not ls / find / grep / cat. "
+                       "Don't pipe to `more`: its output is lost when not attached to a console. "
+                       "Standard input is closed, so anything that reads it (find / sort / more with no "
+                       "file argument) gets EOF instead of waiting for you — `find /c /n \"str\"` counts "
+                       "lines from that empty input and silently returns 0. To count the lines of a file "
+                       "use `find /c /v \"\" <file>`. "
+                       "Empty output comes back as `(no output, exit code N)`, and a non-zero exit code "
+                       "is appended to whatever the command printed — so a failure never looks like a success.",
         "parameters": {"type": "object", "properties": {
             "command": {"type": "string", "description": "The shell command to run."}
         }, "required": ["command"]},
@@ -25,6 +35,9 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "read_file",
         "description": "Read the contents of a file. Returns up to `limit` lines starting at `offset` if specified. "
+                       "Every line is prefixed with its line number (`    12\\t…`) — quote those numbers when "
+                       "citing code, and do NOT paste the prefix into edit_file's old_text/new_text "
+                       "(it is stripped anyway, but cleaner without). "
                        "Paths outside the working directory are read-only and need user approval; "
                        "paths outside the allowed directories are refused.",
         "parameters": {"type": "object", "properties": {
@@ -120,28 +133,86 @@ def _read_text(p) -> tuple[str, str | None]:
         return raw.decode("utf-8", errors="replace"), None
 
 
+def _kill_tree(proc) -> None:
+    """超时清理：连子孙一起杀，别留下孤儿进程。
+
+    `proc.kill()` 只杀 cmd.exe，孙进程（find.exe / python 之类）会活下来继续跑。Windows 上
+    用 taskkill /T 杀整棵树；其它平台退回 kill()。
+    """
+    try:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       capture_output=True, stdin=subprocess.DEVNULL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 def run_bash(command: str) -> str:
-    """真正执行 shell 命令，把输出返回给模型。"""
+    """真正执行 shell 命令，把输出返回给模型。
+
+    返回里**一定带退出码**，这是有意的：只回一句 "(no output)" 的话，
+    「跑成功了但没打印」和「命令失败了、什么都没输出」长得一模一样。
+    模型分不清，就只能一遍遍换写法重试 —— 第一次真跑就是这么烧掉 12 万 token 的
+    （22 次调用里 18 次是 bash，其中一大半是在试探环境）。
+
+    Windows 上 shell=True 走的是 cmd.exe：工具名叫 bash，但 ls / find / grep 都不成立，
+    `| more` 还会把输出吞掉（脱离了控制台）。这条同时写进了工具描述，让模型一开始就知道。
+
+    两个坑都在这里堵死（2026-09-27 run-6 真事：整轮静默卡死 5 分 40 秒，用户只能 Ctrl+C）：
+      1. stdin 必须是 DEVNULL。worker 的 stdin 继承的是用户的终端，而 `find /c /n "x"`
+         这种没给文件参数的命令会去读 stdin —— 于是它等着人敲键盘，永远不返回。
+      2. 超时要把**整棵进程树**杀掉。subprocess.run 超时只杀 cmd.exe，孙进程（find.exe）
+         还攥着 stdout 管道，它内部的 communicate() 就会一直等下去 —— 超时形同虚设
+         （实测：BASH_TIMEOUT=1 的命令真等了 10 秒；find 那种情况就是永远）。
+    """
     MAX_OUTPUT = 30000   # ≈7500 token  源头截断：防止几十 MB 输出撑爆上下文
     lower = command.lower()
     for bad in DENY_LIST:
         if bad in lower:
             return f"Blocked: 命令含高危操作 '{bad}'，已拦截不执行。"
     try:
-        result = subprocess.run(
-            command, shell=True, capture_output=True,
-            timeout=BASH_TIMEOUT, cwd=WORKDIR,   # cwd 固定 workdir，换目录启动也安全
-        )
-        output = _decode_output(result.stdout + result.stderr).strip()
-        if len(output) > MAX_OUTPUT:
-            output = output[:MAX_OUTPUT] + f"\n...(截断：共 {len(output)} 字符，需要完整内容时用 read_file 读)"
-        return output if output else "(no output)"
+        # 输出走临时文件，不走管道。管道有个致命处：超时杀了 cmd.exe 之后，孙进程还攥着
+        # 写端，我们这边读管道就会一直等它 —— 而它可能永远不结束（find 等 stdin 就是这样）。
+        # 文件句柄握在我们自己手里，进程死没死都不影响读取。
+        with tempfile.TemporaryFile() as sink:
+            proc = subprocess.Popen(
+                command, shell=True, cwd=WORKDIR,   # cwd 固定 workdir，换目录启动也安全
+                stdin=subprocess.DEVNULL,           # 见上面第 1 条：别让它等人敲键盘
+                stdout=sink, stderr=subprocess.STDOUT,
+            )
+            try:
+                proc.wait(timeout=BASH_TIMEOUT)     # 等的是进程本身，与管道无关
+                code = proc.returncode
+            except subprocess.TimeoutExpired:
+                _kill_tree(proc)                    # 杀不掉也别恋战：句柄在我们手里，不会再卡
+                return (f"Error: 命令超过 {BASH_TIMEOUT}s 没返回，已终止。"
+                        f"换一个更快的做法，或者分几步来。")
+            sink.seek(0)
+            raw = sink.read(MAX_OUTPUT * 2 + 8)     # 多留几个字节，别把多字节字符劈成两半
     except Exception as e:
-        return f"Error: {e}"
+        return f"Error: {type(e).__name__}: {e}"
+
+    output = _decode_output(raw).strip()
+    if len(output) > MAX_OUTPUT:
+        output = output[:MAX_OUTPUT] + f"\n...(截断：只保留前 {MAX_OUTPUT} 字符，需要完整内容时用 read_file 读)"
+    if not output:
+        return f"(no output, exit code {code})"
+    if code != 0:
+        return f"{output}\n(exit code {code})"
+    return output
 
 
 def run_read(path, offset=1, limit=1000):
-    """分页读：默认从第 1 行读 1000 行；offset 翻页。"""
+    """分页读：默认从第 1 行读 1000 行；offset 翻页。每行前面带 `行号<TAB>`。
+
+    **为什么要带行号**：报告要求给 `文件:行号`，而以前返回的内容没有行号，模型只能
+    自己数 —— 实测数出来的行号能偏 2~60 行（同一份报告里前后还不一致，因为它有时
+    绕道用 `findstr /n`）。带上之后它能直接抄，不用猜。
+
+    行号前缀只是**参照**，不是文件内容。edit_file 会把误抄进去的前缀自动剥掉。
+    """
     try:
         text, _enc = _read_text(guard(path))
         lines = text.splitlines()
@@ -149,7 +220,7 @@ def run_read(path, offset=1, limit=1000):
         chunk = lines[start - 1: start - 1 + limit]
         if not chunk:
             return "(no more lines)"
-        out = "\n".join(chunk)
+        out = "\n".join(f"{start + i:>6}\t{line}" for i, line in enumerate(chunk))
         if start + limit - 1 < len(lines):
             out += f"\n... (还有 {len(lines) - (start + limit - 1)} 行未读，用 offset={start + limit} 继续)"
         return out
@@ -170,8 +241,20 @@ def run_write(path, content):
         return f"Error: {e}"
 
 
+# read_file 的每行形如 `    12\t内容`。模型有时候会把行号前缀一起抄进 old_text /
+# new_text：抄进 old_text 就永远匹配不上（报"未找到"，白跑一轮），抄进 new_text
+# 就会把行号**写进文件**（静默改坏）。所以这里统一剥掉。
+_LINE_NO_PREFIX = re.compile(r"^\s*\d+\t", re.MULTILINE)
+
+
+def _strip_line_numbers(text):
+    return _LINE_NO_PREFIX.sub("", text) if isinstance(text, str) else text
+
+
 def run_edit(path, old_text, new_text):
     try:
+        old_text = _strip_line_numbers(old_text)
+        new_text = _strip_line_numbers(new_text)
         p = guard(path, "write")
         text, enc = _read_text(p)
         if enc is None:      # 不是 UTF-8/GBK 文本（可能混了二进制）→ 写回去会损坏它
@@ -192,6 +275,20 @@ def run_edit(path, old_text, new_text):
 
 
 
+# glob 的两道闸：忽略名单 + 条数上限。
+# 真事（被审项目有 96 个 py 文件）：`glob("**/*.py")`
+# 返回了 **17,952 行 / 1,185,797 字符，其中 99.5% 是 `.venv\Lib\site-packages` 里的**。
+# 这一条调用把上下文从 69,534 token 直接推到需要压缩（L3 落盘 1.2 MB、上下文只留 2000 字符预览）。
+# 工具层里只有它没有上限：run_bash 截 30k 字符、run_read 有 limit —— glob 什么都漏。
+GLOB_IGNORE_DIRS = {
+    ".git", ".hg", ".svn", "__pycache__", ".mypy_cache", ".pytest_cache", ".pytest_tmp",
+    ".cache", ".tox", ".next", ".venv", "venv", "rag_venv", "env", "node_modules",
+    "site-packages", "dist-packages", "dist", "build", "target",
+    "storage", "models", "checkpoints", "data", "datasets", "volumes",
+}
+GLOB_MAX_RESULTS = 200
+
+
 def run_glob(pattern):
     """查找匹配文件（相对 WORKDIR；软链穿透到外部的一律不列出）。
 
@@ -199,6 +296,9 @@ def run_glob(pattern):
     ".." 会真的让 pathlib 越界遍历（实测 `..\\..\\**\\*.py` 能把整个盘扫一遍，
     结果虽然被过滤掉，遍历本身照样发生），所以这里直接拒：
     结构上就不给它出去的机会，比事后过滤便宜。
+
+    另外两道闸见 GLOB_IGNORE_DIRS / GLOB_MAX_RESULTS —— 它们防的不是越界，是**噪音**：
+    一个带 .venv 的项目，`**/*.py` 能吐回 1.2 MB 的 site-packages 路径。
     """
     if ".." in Path(pattern).parts:
         return "Error: pattern must stay inside the workdir ('..' is not allowed)"
@@ -206,8 +306,17 @@ def run_glob(pattern):
         matches = []
         for p in WORKDIR.glob(pattern):
             rp = p.resolve()
-            if rp.is_relative_to(WORKDIR) and rp.exists():
-                matches.append(str(p.relative_to(WORKDIR)))
+            if not rp.is_relative_to(WORKDIR) or not rp.exists():
+                continue
+            if GLOB_IGNORE_DIRS.intersection(p.parts):      # 依赖 / 数据目录不进结果
+                continue
+            if len(matches) >= GLOB_MAX_RESULTS:            # 到上限就停，别把上下文撑爆
+                matches.append(f"...(已截断：只列前 {GLOB_MAX_RESULTS} 条，"
+                               f"换个更具体的 pattern 再查)")
+                break
+            # 统一用 POSIX 分隔符输出：模型拿到的路径要么直接回传（read_file 两种都认），
+            # 要么抄进报告。Windows 的 `app\a.py` 混进 Markdown 报告里既难读、又难比对。
+            matches.append(p.relative_to(WORKDIR).as_posix())
         return "\n".join(matches) if matches else "(no matches)"
     except Exception as e:
         return f"Error: {e}"

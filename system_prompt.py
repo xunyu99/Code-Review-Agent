@@ -5,7 +5,7 @@ system_prompt.py — 技能两级加载 + system prompt 组装 + 缓存。
     update_context 只刷技能（记忆 V1 回归）。
 """
 import json
-from config import WORKDIR, TMP_DIR, SKILLS_DIR, MEMORY_DIR
+from config import WORKDIR, TMP_DIR, SKILLS_DIR, MEMORY_DIR, REPORT_CHARS_LIMIT
 from permissions import scope_lines
 from ui import console
 
@@ -74,6 +74,13 @@ PROMPT_SECTIONS = {
         "Use the most specific tool for the job. "
         "Read files in chunks (read_file with offset/limit) instead of loading whole files at once. "
         "Prefer small, verifiable steps over one giant action."
+        " "
+        "This harness caps how many steps one task may take, and it reports the remaining count "
+        "to you on every step. Plan against that cap: survey, read the key files, then stop "
+        "investigating and write the report. Do not spend steps on scratch experiments or on "
+        "details you cannot turn into a finding — a task that hits the cap produces nothing at "
+        "all, so a report built on the evidence you already have beats a perfect one you never "
+        "write. When the remaining count gets low, stop calling tools and answer."
     ),
     # 路径说明直接从 permissions.POLICY 生成，提示词和裁决表同源，改一处就够了
     "workspace": f"Working directory: {WORKDIR}\nPath rules:\n{scope_lines()}",
@@ -107,13 +114,32 @@ def assemble_system_prompt(context: dict) -> str:
         PROMPT_SECTIONS["identity"],
         PROMPT_SECTIONS["workspace"],
         PROMPT_SECTIONS["temp_files"],
-        PROMPT_SECTIONS["output_style"],
+        _output_style_section(),
     ]
     if context.get("skills"):
         sections.append(f"Skills available:\n{context['skills']}")
     if context.get("memories"):          # V1 记忆回归后自动生效
         sections.append(f"Relevant memories:\n{context['memories']}")
     return "\n\n".join(sections)
+
+
+def _output_style_section() -> str:
+    """报告格式规则。**每轮现拼**，因为长度那条要能关掉。
+
+    为什么长度那条是独立的：消融实验要单独摘掉它（`REPORT_CHARS_LIMIT=0`），看
+    "字数约束到底压了多少召回"。写死在 PROMPT_SECTIONS 里就只能在 import 时定死。
+    """
+    rules = [PROMPT_SECTIONS["output_style"]]
+    if REPORT_CHARS_LIMIT > 0:
+        rules.append(
+            f"- Report length: the whole report must stay within {REPORT_CHARS_LIMIT} characters. "
+            "Cover every substantive finding you can back with evidence — do not drop a real issue "
+            "to save room, and do not pad the list with speculation or pure style nits. At most 8 issues. "
+            "Compress the wording instead of cutting the list: each issue is four short lines "
+            "(位置 / 问题 / 依据 / 建议), no code blocks, no long quotes, nothing beyond the three "
+            "headings above."
+        )
+    return "\n".join(rules)
 
 _last_context_key = None
 _last_prompt = None

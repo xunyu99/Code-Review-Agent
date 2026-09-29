@@ -12,21 +12,44 @@ from datetime import datetime
 from pathlib import Path
 import openai
 from openai import OpenAI
-from config import (API_KEY, BASE_URL, MODEL, MAX_TOKENS, THRESHOLD, WORKDIR,
+from config import (API_KEY, BASE_URL, MODEL, MAX_TOKENS, TEMPERATURE, THRESHOLD, WORKDIR,
                     OUTPUT_DIR, TRANSCRIPTS_DIR, FALLBACK_MODEL,
-                    BASE_DELAY_MS, MAX_RECOVERY_RETRIES, MAX_529_RETRIES, MAX_STEPS)
+                    BASE_DELAY_MS, MAX_RECOVERY_RETRIES, MAX_529_RETRIES, MAX_STEPS,
+                    STEP_WARN_REMAINING, SALVAGE_ON_MAX_STEPS, REPORT_CHARS_LIMIT,
+                    STEP_BUDGET_NOTICE)
 from tools import TOOLS, TOOL_HANDLERS
 from permissions import decide
+from session import append_record
 from system_prompt import get_system_prompt, update_context
 from ui import tracker, warn, info, permission_prompt, StreamView
 
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
 
+# ── 一轮的终态 ──
+# 只有正常跑完的一轮才配拿去提炼记忆（见 main.py）。所以「失败」必须是一个能报给
+# 调用方的终态，不能和「跑完了」一样返回 None —— 以前 fatal() 就返回 None，
+# 于是报错、撞上限的轮次照样进记忆提炼，把没结论的东西沉淀成长期记忆。
+OK = None                 # 正常跑完：保持历史返回值，调用方零改动
+FAILED = "failed"         # 所有放弃路径：报错、上下文救不回来、撞上 MAX_STEPS
+INTERRUPTED = "interrupted"   # 用户 Ctrl+C
+
+
 def fatal(messages, reason):
-    """所有放弃路径统一出口：日志 + 把原因写进对话。"""
+    """所有放弃路径统一出口：日志 + 把原因写进对话 + 报告「这轮没跑完」。"""
     warn(reason)
     messages.append({"role": "assistant", "content": f"[Error] {reason}"})
+    return FAILED
+
+
+def turn_completed(status) -> bool:
+    """这一轮算不算「正常跑完」—— main.py 拿它决定提不提炼记忆。
+
+    中断 / 报错 / 撞上限都不算：那些轮次没有结论，从里面提炼出的「发现」会长期留在
+    .memory/ 里，污染以后每一次会话。**撞上限那轮就算抢救出了报告也不算** ——
+    那份报告自己就标着「未能验证」，正是不该被当成持久知识的东西。
+    """
+    return status is OK
 
 
 def _message_has_tool_use(msg: dict) -> bool:
@@ -59,16 +82,40 @@ def _tool_args(tool_call) -> dict:
     return args if isinstance(args, dict) else {}
 
 
-def _accumulate_stream(stream, view) -> tuple[dict, str | None]:
+_USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens",
+                 "prompt_cache_hit_tokens", "prompt_cache_miss_tokens")
+
+
+def _usage_dict(usage) -> dict:
+    """把 usage 统一成普通 dict。各家 SDK 给对象，各家服务商给的字段名也不完全一样。"""
+    dump = getattr(usage, "model_dump", None)
+    data = dump() if callable(dump) else usage
+    if not isinstance(data, dict):
+        data = {k: getattr(usage, k, None) for k in _USAGE_FIELDS}
+    return {k: v for k, v in data.items() if isinstance(v, (int, float))}
+
+
+def _accumulate_stream(stream, view, stats: dict | None = None) -> tuple[dict, str | None]:
     """把流式分片拼回一条完整的 assistant 消息（content + tool_calls）。
 
     要点：content 是一段段文本直接接起来；tool_calls 按 index 归位——
     id / name 只出现在第一个分片（取一次就好），arguments 是切碎的 JSON 字符串，必须逐片累加。
+
+    stats 不为 None 时顺手收两样东西：usage（token 用量）和服务端实际返回的 model
+    （请求里那个只是你要的别名，provider 静默换版本时只有它会变）。
+    这两样都出现在**没有 choices 的收尾分片**里，所以必须在下面那个 continue 之前读。
     """
     content_parts = []
     tool_calls: dict[int, dict] = {}
     finish_reason = None
     for chunk in stream:
+        if stats is not None:
+            model = getattr(chunk, "model", None)
+            if model:
+                stats["model"] = model
+            usage = getattr(chunk, "usage", None)
+            if usage is not None:
+                stats["usage"] = _usage_dict(usage)
         if not getattr(chunk, "choices", None):
             continue                      # 有些服务商会补发一个只有 usage 的空包
         choice = chunk.choices[0]
@@ -407,6 +454,18 @@ CONTINUATION_PROMPT = (
 )
 
 
+# 空回答的重问。模型偶尔会回一条「既没内容、也没工具调用」的消息，循环把它当
+# 「任务完成」放行 —— 于是这一轮 0 字产出，还照样算 OK 去提炼记忆。
+# 这不是跑完了，是交白卷：先重问一次，再白卷就按失败处理。
+EMPTY_ANSWER_RETRIES = 1
+
+EMPTY_ANSWER_PROMPT = (
+    "Your last reply was empty — no text and no tool call. That would end the turn "
+    "with nothing delivered. Answer now: if you are done, write the final answer; "
+    "if you still need a tool, call it."
+)
+
+
 class RecoveryState:
     """记录哪些恢复动作已经用过 + 当前模型。"""
     def __init__(self):
@@ -494,6 +553,110 @@ def _repeat_hint(counts: dict, tool_name: str, args: dict) -> str:
             f"你已经调用过这个，换个做法：换参数、换工具，或者直接把结论写出来。")
 
 
+# ── 步数预算：把那道「隐形墙」显形 ──
+# 背景：撞 MAX_STEPS 的失败样本全是 0 产出（bench/runs 里六次无一例外）。
+# 根因不是「模型笨」，而是**没有任何地方告诉它有预算**：system prompt 和 skill 里
+# 一个字都没提，提示词反而在说「Read files in chunks」「Prefer small, verifiable steps」。
+# 于是模型按部就班地勘察、取证、写探针，走到第 20 步被硬停，前面的工作全作废。
+#
+# 修法是让预算每轮可见，而不是把墙拆掉。三处细节都是有意的：
+#   · 追加在**发给 API 的消息末尾**，不动 system：system 是缓存前缀，每步改它会打掉
+#     整个 prompt cache；放末尾只多一条消息，前面的前缀照样命中缓存。
+#   · 不 append 进 messages：那是会存盘的工作副本，提示写进去会污染 sessions/archives
+#     和离线重放分析（bench/replay 数步数、数报告都读它）。
+#   · 措辞随剩余步数升级：宽裕时只说「该收尾了」，紧张时直接命令停止调工具、开始写报告。
+def step_budget_notice(step: int, max_steps: int) -> str:
+    """这一步的预算提示。措辞按剩余步数分三档 —— 越紧说得越硬。"""
+    remaining = max_steps - step
+    if remaining <= 2:
+        return (f"[步数预算] 第 {step}/{max_steps} 步，只剩 {remaining} 步："
+                "现在停止一切工具调用，直接用已有证据写最终报告"
+                f"（总长控制在 {REPORT_CHARS_LIMIT} 字以内）。"
+                "再调一次工具，本轮就会被强制终止、全部产出作废 —— "
+                "一份不完整但写出来的报告，也好过 0 字。")
+    if remaining <= STEP_WARN_REMAINING:
+        return (f"[步数预算] 第 {step}/{max_steps} 步，只剩 {remaining} 步："
+                "停止新的勘察、实验和探针，把已经查到的结论写成最终报告"
+                f"（总长控制在 {REPORT_CHARS_LIMIT} 字以内）。")
+    return (f"[步数预算] 第 {step}/{max_steps} 步，还剩 {remaining} 步。"
+            "读到关键文件、证据足以支撑结论后，就该收手写报告；"
+            "不要为了穷尽细节一直取证，也别做与结论无关的小实验。")
+
+
+def with_step_budget(messages, step: int, max_steps: int):
+    """返回「这一次要发出去的」消息列表：末尾追加一条预算提示，原 messages 不动。"""
+    if not STEP_BUDGET_NOTICE:          # 消融用：STEP_BUDGET_NOTICE=off 就完全不追加
+        return messages
+    return messages + [{"role": "user", "content": step_budget_notice(step, max_steps)}]
+
+
+# ── 撞上限的硬兜底：把已有信息抢救成一份报告 ──
+# 为什么需要它：这个 skill 的工作流是「一次性终局报告」，中间不落产物。所以以前撞上
+# MAX_STEPS 就是 0 字 + 全额账单（bench/runs 六次全是这样，最贵的一次 44 万输入 token）。
+# 现在预算用尽时不直接放弃，而是**再给一次「不许调工具」的机会**，逼它把查到的写出来。
+#
+# 两条纪律，都不是随便定的：
+#   · 这一步**不传 tools**。传了它可能又去调工具，留下配不到结果的 tool_call，
+#     那份对话再发出去就是 400。
+#   · 抢救出的报告**排在 [Error] 前面**。run_task._core_summary 和 replay.final_report
+#     都是从尾部往前找「第一条非 [Error] 的 assistant 文本」当报告，再用 [Error] 定
+#     end_reason。这个顺序让两边同时成立：报告字数 > 0（产出被记下来），
+#     结束原因仍然是「撞上限」（不把失败洗成成功）。
+BUDGET_EXHAUSTED_PROMPT = (
+    "Step budget exhausted — you cannot call any more tools. "
+    "Write the final answer NOW, using only the evidence you have already gathered. "
+    "Keep the required report structure and mark anything you could not verify as unverified. "
+    f"Keep the whole report within {REPORT_CHARS_LIMIT} characters. "
+    "Be honest about what is missing; a shorter, honest report is exactly what is wanted here. "
+    "Do not apologize, do not recap the process."
+)
+
+
+def salvage_report(messages, state, max_tokens) -> str:
+    """预算用尽后的最后一次调用：不传工具，只要它把已知信息写成报告。失败返回空串。"""
+    view = StreamView()
+    _ACTIVE["view"] = view
+    stats: dict = {}
+
+    def call_once():
+        view.start()
+        stats.clear()
+        try:
+            with client.chat.completions.create(
+                model=state.current_model,
+                messages=messages + [{"role": "user", "content": BUDGET_EXHAUSTED_PROMPT}],
+                max_tokens=max_tokens,          # 故意不传 tools：它没得调，只能写字
+                stream=True,
+                stream_options={"include_usage": True},
+                **({"temperature": TEMPERATURE} if TEMPERATURE is not None else {}),
+                extra_body={"thinking": {"type": "disabled"}},
+            ) as stream:
+                return _accumulate_stream(stream, view, stats)
+        except KeyboardInterrupt:
+            raise                               # 中断交给上层收尾，别在这里吞掉
+        except BaseException:
+            view.abort()
+            raise
+
+    try:
+        msg_dict, _finish = with_retry(call_once, state)
+    except KeyboardInterrupt:
+        raise
+    except Exception as e:
+        view.abort()
+        warn(f"[budget] 抢救报告失败：{type(e).__name__}: {e}")
+        return ""
+
+    view.commit(rule=True)
+    if stats.get("usage") or stats.get("model"):
+        append_record(messages, {"type": "usage", "step": "salvage",
+                                 "model": stats.get("model"),
+                                 "usage": stats.get("usage") or {}})
+    # 万一服务端在没有 tools 的情况下还是回了 tool_calls：只取文本，别把配不到
+    # 结果的调用塞进对话 —— 那份 messages 会存盘，之后再发出去就是 400。
+    return (msg_dict.get("content") or "").strip()
+
+
 # 半截回答的收尾标记。只进 messages，不进屏幕：用户知道自己按了 Ctrl+C，
 # 需要被提醒的是模型 —— 上面那句是我自己没写完的，不是我说完了。
 # 没有这个标记，模型看到自己一句断掉的话，会想「把它补完」，
@@ -522,16 +685,18 @@ def _abort_turn(messages) -> None:
 def agent_loop(messages, context):
     """对外入口：Ctrl+C 在这一层吃掉——只中断本轮，程序不退。
 
-    返回值：正常跑完是 None；本轮被 Ctrl+C 打断时返回 "interrupted"。
-    调用方看到它就该跳过「事后动作」（提炼记忆之类）——
-    半截对话没有结论，不该拿它去下判断。
+    返回值是本轮终态，三种（见文件上方的 OK / FAILED / INTERRUPTED）：
+      OK（None）    正常跑完 —— 有结论，调用方可以做「事后动作」（提炼记忆之类）
+      INTERRUPTED   用户 Ctrl+C
+      FAILED        报错 / 上下文救不回来 / 撞上 MAX_STEPS（抢救出报告的那种也算）
+    后两种都没有结论，调用方必须跳过事后动作 —— 拿它们去下判断会污染长期记忆。
     """
     _ACTIVE["view"] = None
     try:
         return _agent_loop_inner(messages, context)
     except KeyboardInterrupt:
         _abort_turn(messages)
-        return "interrupted"
+        return INTERRUPTED
 
 
 def _agent_loop_inner(messages, context):
@@ -540,9 +705,18 @@ def _agent_loop_inner(messages, context):
     repeat_counts = {}             # 本轮 (工具, 参数) 的调用计数，用于重复调用提醒
     max_tokens = MAX_TOKENS        # 改：直接 8192，不再 1000 起步
     step = 0
+    empty_retries = 0              # 空回答重问了几次（见 EMPTY_ANSWER_RETRIES）
     while True:
         step += 1
         if step > MAX_STEPS:
+            # 预算用尽 ≠ 直接放弃：先逼它把已有信息写成报告，再落 [Error] 标记。
+            # 「报告在前、[Error] 在后」这个顺序是给 bench 留的接口，别调换
+            # （理由见 salvage_report 上面的注释）。
+            if SALVAGE_ON_MAX_STEPS:
+                warn(f"步数已达上限 {MAX_STEPS}，正在用已有信息产出报告")
+                salvaged = salvage_report(messages, state, max_tokens)
+                if salvaged:
+                    messages.append({"role": "assistant", "content": salvaged})
             return fatal(messages, f"max steps ({MAX_STEPS}) exceeded, stop to avoid infinite loop")
         # s10：每轮开始用最新 context 组装 system，整体替换 messages[0]
         messages[0] = {"role": "system", "content": get_system_prompt(context)}
@@ -565,20 +739,30 @@ def _agent_loop_inner(messages, context):
 
         view = StreamView()
         _ACTIVE["view"] = view          # 交给 Ctrl+C 收尾用（见 _abort_turn）
+        stats: dict = {}                # 这一次调用的 usage + 服务端实际返回的模型版本
+        # 这一次要发出去的消息 = 工作副本 + 末尾一条预算提示。工作副本本身不动，
+        # 提示也就不会落进 sessions/archives（那是离线重放要读的原文）。
+        api_messages = with_step_budget(messages, step, MAX_STEPS)
+        if MAX_STEPS - step == STEP_WARN_REMAINING:
+            info(f"[budget] 只剩 {STEP_WARN_REMAINING} 步，已开始催促收尾")
 
         def stream_once():
             """建流 + 收流。with_retry 会整段重跑，所以每次开新流前先把半截预览擦掉。"""
             view.start()
+            stats.clear()               # 重跑时别把上一次的计数留下来
             try:
                 with client.chat.completions.create(
                     model=state.current_model,
-                    messages=messages,
+                    messages=api_messages,
                     tools=TOOLS,
                     max_tokens=max_tokens,
                     stream=True,
+                    # 让服务端在收尾分片里带上 usage —— 不开这个，流式响应可能一个 token 数都不给
+                    stream_options={"include_usage": True},
+                    **({"temperature": TEMPERATURE} if TEMPERATURE is not None else {}),
                     extra_body={"thinking": {"type": "disabled"}},
                 ) as stream:
-                    return _accumulate_stream(stream, view)
+                    return _accumulate_stream(stream, view, stats)
             except KeyboardInterrupt:
                 raise                 # 中断：保住已收到的内容，交给下面收尾
             except BaseException:
@@ -599,12 +783,20 @@ def _agent_loop_inner(messages, context):
                 return fatal(messages, "context still too long after reactive compact")
             return fatal(messages, f"{type(e).__name__}: {e}")
 
+        # token 与「实际服务版本」落进 archives：成本那一项靠它，provider 静默换版本也靠它。
+        # 没挂日志（测试里直接传 list）时 append_record 返回 False，这里不用管。
+        if stats.get("usage") or stats.get("model"):
+            append_record(messages, {"type": "usage", "step": step,
+                                     "model": stats.get("model"),
+                                     "usage": stats.get("usage") or {}})
+
         is_final = not msg_dict.get("tool_calls")
         # 中途解说（后面还要调工具）和续写片段都不画分隔线：它们和上一段是同一轮回答
         view.commit(rule=is_final and state.recovery_count == 0)
 
         # finish_reason 回答 "模型这一轮为什么停下来了"，流式下由最后一个分片带出来。
         # "length"的含义很直白：生成还没写完，撞上了 max_tokens 上限，被服务端强制掐断。
+        # （下面小表里的"412 行"是旧行号：续写分支现在就在本文件往下十几行。）
         # "stop"	 模型自然说完了（遇到结束标记）	  直接收下，正常结束
         # "tool_calls"   模型决定调用工具，这一轮是 "工具调用请求"	执行工具，结果塞回 messages，循环继续
         # "length"	 单次输出达到 max_tokens（你的 8192），没说完被硬截断	412 行续写分支接住
@@ -618,6 +810,17 @@ def _agent_loop_inner(messages, context):
                 info(f"[max_tokens] continuation {state.recovery_count}/{MAX_RECOVERY_RETRIES}")
                 continue
             return fatal(messages, "still truncated after 3 continuations")
+
+        # 空回答：既没内容也没工具调用 —— 这不是「跑完了」，是交白卷。
+        # 那条空 assistant 消息**不写进 messages**：有些服务商不接受 content 为空的
+        # assistant 消息，而且它本身不携带任何信息。直接重问，重问还是一个样就算失败。
+        if is_final and not (msg_dict.get("content") or "").strip():
+            if empty_retries < EMPTY_ANSWER_RETRIES:
+                empty_retries += 1
+                messages.append({"role": "user", "content": EMPTY_ANSWER_PROMPT})
+                info(f"[empty] 模型交了白卷，重问一次 {empty_retries}/{EMPTY_ANSWER_RETRIES}")
+                continue      # 步数要是刚好用完，下一轮就走 MAX_STEPS 的抢救分支
+            return fatal(messages, "model returned an empty final answer")
 
         messages.append(msg_dict)
 

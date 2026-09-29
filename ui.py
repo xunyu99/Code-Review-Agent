@@ -222,6 +222,20 @@ def show_answer(text: str, rule: bool = True) -> None:
 
 # ---------- 工具生命周期：spinner 转动 → 冻结成 ✓/✗ ----------
 # 注意：仅支持串行工具调用（本项目工具一个个执行）；并发需按 tool_call_id 分别建状态。
+_FAIL_MARKERS = ("Error", "Blocked", "Permission denied", "Unknown tool", "Invalid")
+# 两种形状都算：`(exit code 7)` 和 `(no output, exit code 7)`
+_NONZERO_EXIT = re.compile(r"\bexit code [1-9]\d*\)\s*$", re.MULTILINE)
+
+
+def _looks_failed(text: str) -> bool:
+    """拿不准成败时按文本判断（调用方给不出 failed 才会走到这里）。
+
+    非零退出码也算失败：`run_bash` 会把 `(exit code N)` 附在输出末尾，
+    不认它的话，一条失败的命令会在屏幕上被打成 ✓ —— 那就是界面在撒谎。
+    """
+    return text.startswith(_FAIL_MARKERS) or bool(_NONZERO_EXIT.search(text))
+
+
 class ToolTracker:
     def __init__(self):
         self._live = None
@@ -256,8 +270,7 @@ class ToolTracker:
         self.stop()
         s = str(output)
         if failed is None:
-            failed = s.startswith(("Error", "Blocked", "Permission denied",
-                                   "Unknown tool", "Invalid"))
+            failed = _looks_failed(s)
         mark, color = ("✗", "ui.fail") if failed else ("✓", "ui.structure")
         size = f"{len(s)} chars" if s else "no output"
         line = Text(f"{mark} ", style=color)
@@ -364,12 +377,21 @@ def info(msg: str) -> None:
 
 
 def permission_prompt(title: str, detail: str) -> bool:
-    """权限确认——也走 prompt_toolkit，统一输入通道。Ctrl+C / Ctrl+D 一律算拒绝。"""
+    """权限确认——也走 prompt_toolkit，统一输入通道。Ctrl+C / Ctrl+D 一律算拒绝。
+
+    没有可用控制台时（重定向、后台、评测子进程）prompt_toolkit 会直接抛
+    NoConsoleScreenBufferError，它不属于 KeyboardInterrupt / EOFError。
+    这种环境"问不了人"，一律按拒绝处理；绝不让异常冒到顶层——它一冒出去，
+    整轮任务连同已经跑出来的中间结果全没了（真跑第一次就是这么整轮丢掉的）。
+    """
     console.print(Padding(Text("[PERMISSION] ", style="bold ui.accent") + Text(str(title)), (0, PAD_X)))
     console.print(Padding(Text(str(detail), style="ui.dim"), (0, PAD_X)))
     try:
         choice = pt_prompt("  Allow? [y/N] ", style=_input_style).strip().lower()
     except (KeyboardInterrupt, EOFError):
         print()
+        return False
+    except Exception as e:
+        info(f"没有可用的交互控制台（{type(e).__name__}），这次操作按拒绝处理")
         return False
     return choice in ("y", "yes")
