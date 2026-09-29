@@ -20,3 +20,6 @@ bench/runs-baseline/
 #   任务夹具不随仓库发布 —— 使用者拿自己的仓库去跑（--repo 指哪审哪）
 bench/tasks/
 *.log
+
+# ---- 本地测试/量化文档：写得细、且带本机路径，不随仓库发布 ----
+TESTING.md
